@@ -1,0 +1,2565 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace ProfessionalLLM
+{
+    // ==================== CORE TENSOR & AUTOGRAD ====================
+    
+    public interface IAutogradOperation
+    {
+        void Forward();
+        void Backward();
+        Tensor[] GetInputs();
+        Tensor[] GetOutputs();
+    }
+
+    public class Tensor
+    {
+        public float[] Data { get; private set; }
+        public float[] Grad { get; private set; }
+        public int[] Shape { get; private set; }
+        public int[] Strides { get; private set; }
+        public int TotalSize { get; private set; }
+        public bool RequiresGrad { get; set; }
+        public string Name { get; set; }
+        public IAutogradOperation Operation { get; set; }
+        public List<Tensor> Parents { get; private set; } = new List<Tensor>();
+        
+        // Graph state
+        private bool _gradAccumulated = false;
+        
+        public Tensor(int[] shape, bool requiresGrad = false, string name = null)
+        {
+            Shape = shape;
+            Name = name;
+            RequiresGrad = requiresGrad;
+            
+            TotalSize = 1;
+            Strides = new int[shape.Length];
+            for (int i = shape.Length - 1; i >= 0; i--)
+            {
+                Strides[i] = TotalSize;
+                TotalSize *= shape[i];
+            }
+            
+            Data = new float[TotalSize];
+            
+            if (requiresGrad)
+            {
+                Grad = new float[TotalSize];
+            }
+        }
+        
+        public Tensor(float[] data, int[] shape, bool requiresGrad = false, string name = null)
+        {
+            if (data.Length != shape.Aggregate(1, (a, b) => a * b))
+                throw new ArgumentException($"Data length {data.Length} doesn't match shape {string.Join("x", shape)}");
+                
+            Data = data;
+            Shape = shape;
+            Name = name;
+            RequiresGrad = requiresGrad;
+            
+            TotalSize = data.Length;
+            Strides = new int[shape.Length];
+            
+            int stride = 1;
+            for (int i = shape.Length - 1; i >= 0; i--)
+            {
+                Strides[i] = stride;
+                stride *= shape[i];
+            }
+            
+            if (requiresGrad)
+            {
+                Grad = new float[TotalSize];
+            }
+        }
+        
+        public int GetIndex(params int[] indices)
+        {
+            int index = 0;
+            for (int i = 0; i < indices.Length; i++)
+            {
+                index += indices[i] * Strides[i];
+            }
+            return index;
+        }
+        
+        public float this[params int[] indices]
+        {
+            get => Data[GetIndex(indices)];
+            set => Data[GetIndex(indices)] = value;
+        }
+        
+        public void ZeroGrad()
+        {
+            if (Grad != null)
+            {
+                Array.Fill(Grad, 0f);
+                _gradAccumulated = false;
+            }
+        }
+        
+        public Tensor View(params int[] newShape)
+        {
+            int newSize = 1;
+            foreach (var dim in newShape) newSize *= dim;
+            
+            if (newSize != TotalSize)
+                throw new ArgumentException($"View shape mismatch: {newSize} != {TotalSize}");
+            
+            var result = new Tensor(Data, newShape, RequiresGrad, $"{Name}_view");
+            result.Operation = new ViewOp(this, result);
+            result.Parents.Add(this);
+            
+            return result;
+        }
+        
+        public Tensor Reshape(params int[] newShape)
+        {
+            return View(newShape);
+        }
+        
+        public Tensor Permute(params int[] dims)
+        {
+            if (dims.Length != Shape.Length)
+                throw new ArgumentException("Permute dimensions must match tensor rank");
+            
+            // Validate permutation
+            var sortedDims = dims.OrderBy(x => x).ToArray();
+            for (int i = 0; i < sortedDims.Length; i++)
+            {
+                if (sortedDims[i] != i)
+                    throw new ArgumentException($"Invalid permutation: {string.Join(",", dims)}");
+            }
+            
+            int[] newShape = new int[dims.Length];
+            for (int i = 0; i < dims.Length; i++)
+            {
+                newShape[i] = Shape[dims[i]];
+            }
+            
+            var result = new Tensor(newShape, RequiresGrad, $"{Name}_permute");
+            result.Operation = new PermuteOp(this, result, dims);
+            result.Parents.Add(this);
+            
+            return result;
+        }
+        
+        public Tensor Transpose(int dim1, int dim2)
+        {
+            if (dim1 < 0 || dim1 >= Shape.Length || dim2 < 0 || dim2 >= Shape.Length)
+                throw new ArgumentException($"Invalid dimensions: {dim1}, {dim2} for shape {string.Join(",", Shape)}");
+            
+            var dims = Enumerable.Range(0, Shape.Length).ToArray();
+            (dims[dim1], dims[dim2]) = (dims[dim2], dims[dim1]);
+            return Permute(dims);
+        }
+        
+        public void Backward(Tensor gradient = null)
+        {
+            if (!RequiresGrad) return;
+            
+            // Prevent multiple backward calls
+            if (_gradAccumulated)
+            {
+                throw new InvalidOperationException("Backward already called on this tensor");
+            }
+            
+            // Initialize gradient
+            if (gradient != null)
+            {
+                if (Grad == null) Grad = new float[TotalSize];
+                if (gradient.TotalSize != TotalSize)
+                    throw new ArgumentException($"Gradient size {gradient.TotalSize} doesn't match tensor size {TotalSize}");
+                    
+                for (int i = 0; i < TotalSize; i++)
+                {
+                    Grad[i] = gradient.Data[i];
+                }
+            }
+            else
+            {
+                // Scalar output - initialize with 1.0
+                if (Grad == null) Grad = new float[TotalSize];
+                if (TotalSize == 1)
+                {
+                    Grad[0] = 1.0f;
+                }
+                else
+                {
+                    throw new InvalidOperationException("Backward() can only be called on scalar tensors without gradient");
+                }
+            }
+            
+            _gradAccumulated = true;
+            
+            // Build computational graph
+            var visited = new HashSet<Tensor>();
+            var order = new List<Tensor>();
+            
+            void BuildTopologicalOrder(Tensor node)
+            {
+                if (visited.Contains(node)) return;
+                visited.Add(node);
+                
+                foreach (var parent in node.Parents)
+                {
+                    BuildTopologicalOrder(parent);
+                }
+                
+                order.Add(node);
+            }
+            
+            BuildTopologicalOrder(this);
+            
+            // Backward in reverse topological order
+            for (int i = order.Count - 1; i >= 0; i--)
+            {
+                var node = order[i];
+                if (node.Operation != null && node.Grad != null)
+                {
+                    node.Operation.Backward();
+                }
+            }
+        }
+        
+        public Tensor Detach()
+        {
+            var detached = new Tensor((float[])Data.Clone(), Shape, false, $"{Name}_detached");
+            return detached;
+        }
+        
+        public override string ToString()
+        {
+            return $"Tensor(shape=[{string.Join(",", Shape)}], name={Name}, requires_grad={RequiresGrad})";
+        }
+        
+        // Validation methods
+        public bool HasValidGradients()
+        {
+            if (Grad == null) return false;
+            
+            foreach (var g in Grad)
+            {
+                if (float.IsNaN(g) || float.IsInfinity(g))
+                    return false;
+            }
+            return true;
+        }
+        
+        public float GradientNorm()
+        {
+            if (Grad == null) return 0f;
+            
+            float sum = 0;
+            foreach (var g in Grad)
+            {
+                sum += g * g;
+            }
+            return (float)Math.Sqrt(sum);
+        }
+    }
+    
+    // ==================== AUTOGRAD OPERATIONS ====================
+    
+    public class ViewOp : IAutogradOperation
+    {
+        private Tensor _input, _output;
+        
+        public ViewOp(Tensor input, Tensor output)
+        {
+            _input = input;
+            _output = output;
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input };
+        public Tensor[] GetOutputs() => new[] { _output };
+        
+        public void Forward()
+        {
+            // Data is already shared, nothing to do
+        }
+        
+        public void Backward()
+        {
+            if (_input.RequiresGrad && _input.Grad != null && _output.Grad != null)
+            {
+                for (int i = 0; i < _output.TotalSize; i++)
+                {
+                    _input.Grad[i] += _output.Grad[i];
+                }
+            }
+        }
+    }
+    
+    public class PermuteOp : IAutogradOperation
+    {
+        private Tensor _input, _output;
+        private int[] _dims;
+        private int[] _inverseDims;
+        
+        public PermuteOp(Tensor input, Tensor output, int[] dims)
+        {
+            _input = input;
+            _output = output;
+            _dims = dims;
+            
+            // Compute inverse permutation
+            _inverseDims = new int[dims.Length];
+            for (int i = 0; i < dims.Length; i++)
+            {
+                _inverseDims[dims[i]] = i;
+            }
+            
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input };
+        public Tensor[] GetOutputs() => new[] { _output };
+        
+        public void Forward()
+        {
+            // Efficient permutation without full copy when possible
+            if (_input.Shape.Length <= 4)
+            {
+                // Optimized path for common tensor ranks
+                ForwardOptimized();
+            }
+            else
+            {
+                ForwardGeneral();
+            }
+        }
+        
+        private void ForwardGeneral()
+        {
+            int[] inputIndices = new int[_input.Shape.Length];
+            int[] outputIndices = new int[_output.Shape.Length];
+            
+            for (int linearIdx = 0; linearIdx < _input.TotalSize; linearIdx++)
+            {
+                // Convert linear index to input indices
+                int temp = linearIdx;
+                for (int d = _input.Shape.Length - 1; d >= 0; d--)
+                {
+                    inputIndices[d] = temp % _input.Shape[d];
+                    temp /= _input.Shape[d];
+                }
+                
+                // Apply permutation
+                for (int d = 0; d < _dims.Length; d++)
+                {
+                    outputIndices[d] = inputIndices[_dims[d]];
+                }
+                
+                // Convert to output linear index
+                int outIdx = 0;
+                for (int d = 0; d < outputIndices.Length; d++)
+                {
+                    outIdx = outIdx * _output.Shape[d] + outputIndices[d];
+                }
+                
+                _output.Data[outIdx] = _input.Data[linearIdx];
+            }
+        }
+        
+        private void ForwardOptimized()
+        {
+            // Optimized for common cases (2D, 3D, 4D)
+            if (_input.Shape.Length == 2)
+            {
+                // 2D transpose
+                int rows = _input.Shape[0];
+                int cols = _input.Shape[1];
+                
+                if (_dims[0] == 1 && _dims[1] == 0)
+                {
+                    // Simple transpose
+                    for (int i = 0; i < rows; i++)
+                    {
+                        for (int j = 0; j < cols; j++)
+                        {
+                            _output.Data[j * rows + i] = _input.Data[i * cols + j];
+                        }
+                    }
+                }
+            }
+            else if (_input.Shape.Length == 4)
+            {
+                // Common in attention: [B, H, S, D] permutations
+                int b = _input.Shape[0];
+                int h = _input.Shape[1];
+                int s = _input.Shape[2];
+                int d = _input.Shape[3];
+                
+                if (_dims[0] == 0 && _dims[1] == 2 && _dims[2] == 1 && _dims[3] == 3)
+                {
+                    // [B, H, S, D] -> [B, S, H, D]
+                    for (int bi = 0; bi < b; bi++)
+                    {
+                        for (int hi = 0; hi < h; hi++)
+                        {
+                            for (int si = 0; si < s; si++)
+                            {
+                                for (int di = 0; di < d; di++)
+                                {
+                                    int inIdx = ((bi * h + hi) * s + si) * d + di;
+                                    int outIdx = ((bi * s + si) * h + hi) * d + di;
+                                    _output.Data[outIdx] = _input.Data[inIdx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                ForwardGeneral();
+            }
+        }
+        
+        public void Backward()
+        {
+            if (_input.RequiresGrad && _input.Grad != null && _output.Grad != null)
+            {
+                // Similar optimization as forward
+                if (_input.Shape.Length <= 4)
+                {
+                    BackwardOptimized();
+                }
+                else
+                {
+                    BackwardGeneral();
+                }
+            }
+        }
+        
+        private void BackwardGeneral()
+        {
+            int[] inputIndices = new int[_input.Shape.Length];
+            int[] outputIndices = new int[_output.Shape.Length];
+            
+            for (int linearIdx = 0; linearIdx < _output.TotalSize; linearIdx++)
+            {
+                // Convert linear index to output indices
+                int temp = linearIdx;
+                for (int d = _output.Shape.Length - 1; d >= 0; d--)
+                {
+                    outputIndices[d] = temp % _output.Shape[d];
+                    temp /= _output.Shape[d];
+                }
+                
+                // Apply inverse permutation
+                for (int d = 0; d < _inverseDims.Length; d++)
+                {
+                    inputIndices[d] = outputIndices[_inverseDims[d]];
+                }
+                
+                // Convert to input linear index
+                int inIdx = 0;
+                for (int d = 0; d < inputIndices.Length; d++)
+                {
+                    inIdx = inIdx * _input.Shape[d] + inputIndices[d];
+                }
+                
+                _input.Grad[inIdx] += _output.Grad[linearIdx];
+            }
+        }
+        
+        private void BackwardOptimized()
+        {
+            if (_input.Shape.Length == 2)
+            {
+                int rows = _input.Shape[0];
+                int cols = _input.Shape[1];
+                
+                if (_dims[0] == 1 && _dims[1] == 0)
+                {
+                    for (int i = 0; i < rows; i++)
+                    {
+                        for (int j = 0; j < cols; j++)
+                        {
+                            _input.Grad[i * cols + j] += _output.Grad[j * rows + i];
+                        }
+                    }
+                }
+            }
+            else if (_input.Shape.Length == 4)
+            {
+                int b = _input.Shape[0];
+                int h = _input.Shape[1];
+                int s = _input.Shape[2];
+                int d = _input.Shape[3];
+                
+                if (_dims[0] == 0 && _dims[1] == 2 && _dims[2] == 1 && _dims[3] == 3)
+                {
+                    for (int bi = 0; bi < b; bi++)
+                    {
+                        for (int hi = 0; hi < h; hi++)
+                        {
+                            for (int si = 0; si < s; si++)
+                            {
+                                for (int di = 0; di < d; di++)
+                                {
+                                    int inIdx = ((bi * h + hi) * s + si) * d + di;
+                                    int outIdx = ((bi * s + si) * h + hi) * d + di;
+                                    _input.Grad[inIdx] += _output.Grad[outIdx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                BackwardGeneral();
+            }
+        }
+    }
+    
+    public class MatMulOp : IAutogradOperation
+    {
+        private Tensor _a, _b, _result;
+        private bool _transposeA, _transposeB;
+        
+        public MatMulOp(Tensor a, Tensor b, Tensor result, bool transposeA = false, bool transposeB = false)
+        {
+            _a = a;
+            _b = b;
+            _result = result;
+            _transposeA = transposeA;
+            _transposeB = transposeB;
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _a, _b };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            int aRows = _transposeA ? _a.Shape[1] : _a.Shape[0];
+            int aCols = _transposeA ? _a.Shape[0] : _a.Shape[1];
+            int bRows = _transposeB ? _b.Shape[1] : _b.Shape[0];
+            int bCols = _transposeB ? _b.Shape[0] : _b.Shape[1];
+            
+            if (aCols != bRows)
+                throw new ArgumentException($"Matrix dimensions don't match: {aRows}x{aCols} * {bRows}x{bCols}");
+            
+            for (int i = 0; i < aRows; i++)
+            {
+                for (int j = 0; j < bCols; j++)
+                {
+                    float sum = 0;
+                    for (int k = 0; k < aCols; k++)
+                    {
+                        int aIdx = _transposeA ? (k * aRows + i) : (i * aCols + k);
+                        int bIdx = _transposeB ? (j * bRows + k) : (k * bCols + j);
+                        sum += _a.Data[aIdx] * _b.Data[bIdx];
+                    }
+                    _result.Data[i * bCols + j] = sum;
+                }
+            }
+        }
+        
+        public void Backward()
+        {
+            int aRows = _transposeA ? _a.Shape[1] : _a.Shape[0];
+            int aCols = _transposeA ? _a.Shape[0] : _a.Shape[1];
+            int bRows = _transposeB ? _b.Shape[1] : _b.Shape[0];
+            int bCols = _transposeB ? _b.Shape[0] : _b.Shape[1];
+            
+            // Gradient w.r.t A
+            if (_a.RequiresGrad && _a.Grad != null)
+            {
+                // dA = dC @ B^T if not transposed, else dA = B @ dC^T
+                if (!_transposeA)
+                {
+                    for (int i = 0; i < aRows; i++)
+                    {
+                        for (int k = 0; k < aCols; k++)
+                        {
+                            float sum = 0;
+                            for (int j = 0; j < bCols; j++)
+                            {
+                                int gradIdx = i * bCols + j;
+                                int bIdx = _transposeB ? (j * bRows + k) : (k * bCols + j);
+                                sum += _result.Grad[gradIdx] * _b.Data[bIdx];
+                            }
+                            _a.Grad[i * aCols + k] += sum;
+                        }
+                    }
+                }
+                else
+                {
+                    // A is transposed
+                    for (int k = 0; k < aRows; k++)
+                    {
+                        for (int i = 0; i < aCols; i++)
+                        {
+                            float sum = 0;
+                            for (int j = 0; j < bCols; j++)
+                            {
+                                int gradIdx = i * bCols + j;
+                                int bIdx = _transposeB ? (j * bRows + k) : (k * bCols + j);
+                                sum += _result.Grad[gradIdx] * _b.Data[bIdx];
+                            }
+                            _a.Grad[k * aCols + i] += sum;
+                        }
+                    }
+                }
+            }
+            
+            // Gradient w.r.t B
+            if (_b.RequiresGrad && _b.Grad != null)
+            {
+                // dB = A^T @ dC if not transposed, else dB = dC^T @ A
+                if (!_transposeB)
+                {
+                    for (int k = 0; k < bRows; k++)
+                    {
+                        for (int j = 0; j < bCols; j++)
+                        {
+                            float sum = 0;
+                            for (int i = 0; i < aRows; i++)
+                            {
+                                int aIdx = _transposeA ? (k * aRows + i) : (i * aCols + k);
+                                int gradIdx = i * bCols + j;
+                                sum += _a.Data[aIdx] * _result.Grad[gradIdx];
+                            }
+                            _b.Grad[k * bCols + j] += sum;
+                        }
+                    }
+                }
+                else
+                {
+                    // B is transposed
+                    for (int j = 0; j < bRows; j++)
+                    {
+                        for (int k = 0; k < bCols; k++)
+                        {
+                            float sum = 0;
+                            for (int i = 0; i < aRows; i++)
+                            {
+                                int aIdx = _transposeA ? (k * aRows + i) : (i * aCols + k);
+                                int gradIdx = i * bCols + j;
+                                sum += _a.Data[aIdx] * _result.Grad[gradIdx];
+                            }
+                            _b.Grad[j * bCols + k] += sum;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    public class BatchedMatMulOp : IAutogradOperation
+    {
+        private Tensor _a, _b, _result;
+        private bool _transposeA, _transposeB;
+        
+        public BatchedMatMulOp(Tensor a, Tensor b, Tensor result, bool transposeA = false, bool transposeB = false)
+        {
+            _a = a;
+            _b = b;
+            _result = result;
+            _transposeA = transposeA;
+            _transposeB = transposeB;
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _a, _b };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            // Assumes first dimensions are batch dimensions
+            int batchDims = _a.Shape.Length - 2;
+            int batchSize = 1;
+            for (int i = 0; i < batchDims; i++)
+            {
+                batchSize *= _a.Shape[i];
+            }
+            
+            int aRows = _transposeA ? _a.Shape[batchDims + 1] : _a.Shape[batchDims];
+            int aCols = _transposeA ? _a.Shape[batchDims] : _a.Shape[batchDims + 1];
+            int bRows = _transposeB ? _b.Shape[batchDims + 1] : _b.Shape[batchDims];
+            int bCols = _transposeB ? _b.Shape[batchDims] : _b.Shape[batchDims + 1];
+            
+            if (aCols != bRows)
+                throw new ArgumentException($"Matrix dimensions don't match: {aRows}x{aCols} * {bRows}x{bCols}");
+            
+            int aStride = aRows * aCols;
+            int bStride = bRows * bCols;
+            int resultStride = aRows * bCols;
+            
+            for (int batch = 0; batch < batchSize; batch++)
+            {
+                int aBase = batch * aStride;
+                int bBase = batch * bStride;
+                int resultBase = batch * resultStride;
+                
+                for (int i = 0; i < aRows; i++)
+                {
+                    for (int j = 0; j < bCols; j++)
+                    {
+                        float sum = 0;
+                        for (int k = 0; k < aCols; k++)
+                        {
+                            int aIdx = aBase + (_transposeA ? (k * aRows + i) : (i * aCols + k));
+                            int bIdx = bBase + (_transposeB ? (j * bRows + k) : (k * bCols + j));
+                            sum += _a.Data[aIdx] * _b.Data[bIdx];
+                        }
+                        _result.Data[resultBase + i * bCols + j] = sum;
+                    }
+                }
+            }
+        }
+        
+        public void Backward()
+        {
+            int batchDims = _a.Shape.Length - 2;
+            int batchSize = 1;
+            for (int i = 0; i < batchDims; i++)
+            {
+                batchSize *= _a.Shape[i];
+            }
+            
+            int aRows = _transposeA ? _a.Shape[batchDims + 1] : _a.Shape[batchDims];
+            int aCols = _transposeA ? _a.Shape[batchDims] : _a.Shape[batchDims + 1];
+            int bRows = _transposeB ? _b.Shape[batchDims + 1] : _b.Shape[batchDims];
+            int bCols = _transposeB ? _b.Shape[batchDims] : _b.Shape[batchDims + 1];
+            
+            int aStride = aRows * aCols;
+            int bStride = bRows * bCols;
+            int resultStride = aRows * bCols;
+            
+            // Gradient w.r.t A
+            if (_a.RequiresGrad && _a.Grad != null)
+            {
+                for (int batch = 0; batch < batchSize; batch++)
+                {
+                    int aBase = batch * aStride;
+                    int bBase = batch * bStride;
+                    int resultBase = batch * resultStride;
+                    
+                    if (!_transposeA)
+                    {
+                        for (int i = 0; i < aRows; i++)
+                        {
+                            for (int k = 0; k < aCols; k++)
+                            {
+                                float sum = 0;
+                                for (int j = 0; j < bCols; j++)
+                                {
+                                    int gradIdx = resultBase + i * bCols + j;
+                                    int bIdx = bBase + (_transposeB ? (j * bRows + k) : (k * bCols + j));
+                                    sum += _result.Grad[gradIdx] * _b.Data[bIdx];
+                                }
+                                _a.Grad[aBase + i * aCols + k] += sum;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // A is transposed
+                        for (int k = 0; k < aRows; k++)
+                        {
+                            for (int i = 0; i < aCols; i++)
+                            {
+                                float sum = 0;
+                                for (int j = 0; j < bCols; j++)
+                                {
+                                    int gradIdx = resultBase + i * bCols + j;
+                                    int bIdx = bBase + (_transposeB ? (j * bRows + k) : (k * bCols + j));
+                                    sum += _result.Grad[gradIdx] * _b.Data[bIdx];
+                                }
+                                _a.Grad[aBase + k * aCols + i] += sum;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Gradient w.r.t B
+            if (_b.RequiresGrad && _b.Grad != null)
+            {
+                for (int batch = 0; batch < batchSize; batch++)
+                {
+                    int aBase = batch * aStride;
+                    int bBase = batch * bStride;
+                    int resultBase = batch * resultStride;
+                    
+                    if (!_transposeB)
+                    {
+                        for (int k = 0; k < bRows; k++)
+                        {
+                            for (int j = 0; j < bCols; j++)
+                            {
+                                float sum = 0;
+                                for (int i = 0; i < aRows; i++)
+                                {
+                                    int aIdx = aBase + (_transposeA ? (k * aRows + i) : (i * aCols + k));
+                                    int gradIdx = resultBase + i * bCols + j;
+                                    sum += _a.Data[aIdx] * _result.Grad[gradIdx];
+                                }
+                                _b.Grad[bBase + k * bCols + j] += sum;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // B is transposed
+                        for (int j = 0; j < bRows; j++)
+                        {
+                            for (int k = 0; k < bCols; k++)
+                            {
+                                float sum = 0;
+                                for (int i = 0; i < aRows; i++)
+                                {
+                                    int aIdx = aBase + (_transposeA ? (k * aRows + i) : (i * aCols + k));
+                                    int gradIdx = resultBase + i * bCols + j;
+                                    sum += _a.Data[aIdx] * _result.Grad[gradIdx];
+                                }
+                                _b.Grad[bBase + j * bCols + k] += sum;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    public class AddOp : IAutogradOperation
+    {
+        private Tensor _a, _b, _result;
+        
+        public AddOp(Tensor a, Tensor b, Tensor result)
+        {
+            _a = a;
+            _b = b;
+            _result = result;
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _a, _b };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            // Simple addition - for now, assume same shape
+            // TODO: Add broadcasting support
+            if (_a.TotalSize != _b.TotalSize)
+                throw new ArgumentException($"Cannot add tensors of different sizes: {_a.TotalSize} != {_b.TotalSize}");
+            
+            for (int i = 0; i < _result.TotalSize; i++)
+            {
+                _result.Data[i] = _a.Data[i] + _b.Data[i];
+            }
+        }
+        
+        public void Backward()
+        {
+            if (_a.RequiresGrad && _a.Grad != null)
+            {
+                for (int i = 0; i < _a.TotalSize; i++)
+                {
+                    _a.Grad[i] += _result.Grad[i];
+                }
+            }
+            
+            if (_b.RequiresGrad && _b.Grad != null)
+            {
+                for (int i = 0; i < _b.TotalSize; i++)
+                {
+                    _b.Grad[i] += _result.Grad[i];
+                }
+            }
+        }
+    }
+    
+    public class ScaleOp : IAutogradOperation
+    {
+        private Tensor _input, _result;
+        private float _scale;
+        
+        public ScaleOp(Tensor input, Tensor result, float scale)
+        {
+            _input = input;
+            _result = result;
+            _scale = scale;
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            for (int i = 0; i < _result.TotalSize; i++)
+            {
+                _result.Data[i] = _input.Data[i] * _scale;
+            }
+        }
+        
+        public void Backward()
+        {
+            if (_input.RequiresGrad && _input.Grad != null)
+            {
+                for (int i = 0; i < _input.TotalSize; i++)
+                {
+                    _input.Grad[i] += _result.Grad[i] * _scale;
+                }
+            }
+        }
+    }
+    
+    public class AddBiasOp : IAutogradOperation
+    {
+        private Tensor _input, _bias, _result;
+        
+        public AddBiasOp(Tensor input, Tensor bias, Tensor result)
+        {
+            _input = input;
+            _bias = bias;
+            _result = result;
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input, _bias };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            // input: [..., features], bias: [features]
+            int lastDim = _input.Shape[^1];
+            int outer = _input.TotalSize / lastDim;
+            
+            for (int i = 0; i < outer; i++)
+            {
+                for (int j = 0; j < lastDim; j++)
+                {
+                    _result.Data[i * lastDim + j] = _input.Data[i * lastDim + j] + _bias.Data[j];
+                }
+            }
+        }
+        
+        public void Backward()
+        {
+            int lastDim = _input.Shape[^1];
+            int outer = _input.TotalSize / lastDim;
+            
+            if (_input.RequiresGrad && _input.Grad != null)
+            {
+                for (int i = 0; i < _input.TotalSize; i++)
+                {
+                    _input.Grad[i] += _result.Grad[i];
+                }
+            }
+            
+            if (_bias.RequiresGrad && _bias.Grad != null)
+            {
+                for (int i = 0; i < outer; i++)
+                {
+                    for (int j = 0; j < lastDim; j++)
+                    {
+                        _bias.Grad[j] += _result.Grad[i * lastDim + j];
+                    }
+                }
+            }
+        }
+    }
+    
+    public class SoftmaxOp : IAutogradOperation
+    {
+        private Tensor _input, _result;
+        private float[] _expCache;
+        private float[] _softmaxCache;
+        
+        public SoftmaxOp(Tensor input, Tensor result)
+        {
+            _input = input;
+            _result = result;
+            _expCache = new float[input.TotalSize];
+            _softmaxCache = new float[input.TotalSize];
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            // Softmax over last dimension
+            int lastDim = _input.Shape[^1];
+            int outer = _input.TotalSize / lastDim;
+            
+            for (int i = 0; i < outer; i++)
+            {
+                // Find max for numerical stability
+                float max = float.NegativeInfinity;
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float val = _input.Data[i * lastDim + j];
+                    max = Math.Max(max, val);
+                }
+                
+                // Compute exponentials and sum
+                float sum = 0;
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float expVal = (float)Math.Exp(_input.Data[i * lastDim + j] - max);
+                    _expCache[i * lastDim + j] = expVal;
+                    sum += expVal;
+                }
+                
+                // Normalize and store
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float softmaxVal = _expCache[i * lastDim + j] / sum;
+                    _result.Data[i * lastDim + j] = softmaxVal;
+                    _softmaxCache[i * lastDim + j] = softmaxVal;
+                }
+            }
+        }
+        
+        public void Backward()
+        {
+            if (!_input.RequiresGrad || _input.Grad == null) return;
+            
+            int lastDim = _input.Shape[^1];
+            int outer = _input.TotalSize / lastDim;
+            
+            for (int i = 0; i < outer; i++)
+            {
+                // Compute gradient for this row
+                float[] gradRow = new float[lastDim];
+                float sumGradSoftmax = 0;
+                
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float softmaxVal = _softmaxCache[i * lastDim + j];
+                    gradRow[j] = _result.Grad[i * lastDim + j] * softmaxVal;
+                    sumGradSoftmax += gradRow[j];
+                }
+                
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float softmaxVal = _softmaxCache[i * lastDim + j];
+                    _input.Grad[i * lastDim + j] += gradRow[j] - softmaxVal * sumGradSoftmax;
+                }
+            }
+        }
+    }
+    
+    public class GELUOp : IAutogradOperation
+    {
+        private Tensor _input, _result;
+        private float[] _cache;
+        
+        public GELUOp(Tensor input, Tensor result)
+        {
+            _input = input;
+            _result = result;
+            _cache = new float[input.TotalSize];
+            Forward();
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward()
+        {
+            const float sqrt2OverPi = 0.7978845608028654f;
+            const float coeff = 0.044715f;
+            
+            for (int i = 0; i < _result.TotalSize; i++)
+            {
+                float x = _input.Data[i];
+                float x3 = x * x * x;
+                float inner = sqrt2OverPi * (x + coeff * x3);
+                float tanhVal = (float)Math.Tanh(inner);
+                _result.Data[i] = 0.5f * x * (1 + tanhVal);
+                _cache[i] = tanhVal;
+            }
+        }
+        
+        public void Backward()
+        {
+            if (!_input.RequiresGrad || _input.Grad == null) return;
+            
+            const float sqrt2OverPi = 0.7978845608028654f;
+            const float coeff = 0.044715f;
+            
+            for (int i = 0; i < _input.TotalSize; i++)
+            {
+                float x = _input.Data[i];
+                float tanhVal = _cache[i];
+                float sech2 = 1 - tanhVal * tanhVal;
+                float innerDeriv = sqrt2OverPi * (1 + 3 * coeff * x * x);
+                float deriv = 0.5f * (1 + tanhVal) + 0.5f * x * sech2 * innerDeriv;
+                _input.Grad[i] += _result.Grad[i] * deriv;
+            }
+        }
+    }
+    
+    public class LayerNormOp : IAutogradOperation
+    {
+        private Tensor _input, _gamma, _beta, _result;
+        private float[] _meanCache, _invStdCache, _normalizedCache;
+        
+        public LayerNormOp(Tensor input, Tensor gamma, Tensor beta, Tensor result,
+                         float[] meanCache, float[] invStdCache, float[] normalizedCache)
+        {
+            _input = input;
+            _gamma = gamma;
+            _beta = beta;
+            _result = result;
+            _meanCache = meanCache;
+            _invStdCache = invStdCache;
+            _normalizedCache = normalizedCache;
+        }
+        
+        public Tensor[] GetInputs() => new[] { _input, _gamma, _beta };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward() { }
+        
+        public void Backward()
+        {
+            int lastDim = _input.Shape[^1];
+            int outer = _input.TotalSize / lastDim;
+            
+            // Gradient w.r.t gamma and beta
+            if (_gamma.RequiresGrad && _gamma.Grad != null)
+            {
+                for (int i = 0; i < outer; i++)
+                {
+                    for (int j = 0; j < lastDim; j++)
+                    {
+                        _gamma.Grad[j] += _result.Grad[i * lastDim + j] * _normalizedCache[i * lastDim + j];
+                    }
+                }
+            }
+            
+            if (_beta.RequiresGrad && _beta.Grad != null)
+            {
+                for (int i = 0; i < outer; i++)
+                {
+                    for (int j = 0; j < lastDim; j++)
+                    {
+                        _beta.Grad[j] += _result.Grad[i * lastDim + j];
+                    }
+                }
+            }
+            
+            // Gradient w.r.t input - numerically stable formula
+            if (_input.RequiresGrad && _input.Grad != null)
+            {
+                for (int i = 0; i < outer; i++)
+                {
+                    float mean = _meanCache[i];
+                    float invStd = _invStdCache[i];
+                    
+                    // Compute sum of dy * gamma
+                    float sumDyGamma = 0;
+                    float sumDyGammaNorm = 0;
+                    
+                    for (int j = 0; j < lastDim; j++)
+                    {
+                        float dyGamma = _result.Grad[i * lastDim + j] * _gamma.Data[j];
+                        sumDyGamma += dyGamma;
+                        sumDyGammaNorm += dyGamma * _normalizedCache[i * lastDim + j];
+                    }
+                    
+                    for (int j = 0; j < lastDim; j++)
+                    {
+                        float dyGamma = _result.Grad[i * lastDim + j] * _gamma.Data[j];
+                        float norm = _normalizedCache[i * lastDim + j];
+                        
+                        // Correct gradient formula for LayerNorm
+                        float dx = dyGamma * invStd;
+                        dx -= (sumDyGamma * invStd) / lastDim;
+                        dx -= (norm * sumDyGammaNorm * invStd) / lastDim;
+                        
+                        _input.Grad[i * lastDim + j] += dx;
+                    }
+                }
+            }
+        }
+    }
+    
+    // ==================== TENSOR OPERATIONS ====================
+    
+    public static class Ops
+    {
+        public static Tensor MatMul(Tensor a, Tensor b, bool transposeA = false, bool transposeB = false)
+        {
+            if (a.Shape.Length != 2 || b.Shape.Length != 2)
+                throw new ArgumentException("MatMul requires 2D tensors");
+            
+            int aRows = transposeA ? a.Shape[1] : a.Shape[0];
+            int aCols = transposeA ? a.Shape[0] : a.Shape[1];
+            int bRows = transposeB ? b.Shape[1] : b.Shape[0];
+            int bCols = transposeB ? b.Shape[0] : b.Shape[1];
+            
+            if (aCols != bRows)
+                throw new ArgumentException($"Matrix dimensions don't match: {aRows}x{aCols} * {bRows}x{bCols}");
+            
+            var result = new Tensor(new[] { aRows, bCols }, a.RequiresGrad || b.RequiresGrad);
+            result.Operation = new MatMulOp(a, b, result, transposeA, transposeB);
+            result.Parents.Add(a);
+            result.Parents.Add(b);
+            return result;
+        }
+        
+        public static Tensor BatchedMatMul(Tensor a, Tensor b, bool transposeA = false, bool transposeB = false)
+        {
+            if (a.Shape.Length < 2 || b.Shape.Length < 2)
+                throw new ArgumentException("BatchedMatMul requires tensors with at least 2 dimensions");
+            
+            // Check batch dimensions match
+            for (int i = 0; i < a.Shape.Length - 2; i++)
+            {
+                if (a.Shape[i] != b.Shape[i])
+                    throw new ArgumentException($"Batch dimensions don't match at index {i}: {a.Shape[i]} != {b.Shape[i]}");
+            }
+            
+            int aRows = transposeA ? a.Shape[^1] : a.Shape[^2];
+            int aCols = transposeA ? a.Shape[^2] : a.Shape[^1];
+            int bRows = transposeB ? b.Shape[^1] : b.Shape[^2];
+            int bCols = transposeB ? b.Shape[^2] : b.Shape[^1];
+            
+            if (aCols != bRows)
+                throw new ArgumentException($"Matrix dimensions don't match: {aRows}x{aCols} * {bRows}x{bCols}");
+            
+            // Build result shape
+            int[] resultShape = new int[a.Shape.Length];
+            for (int i = 0; i < a.Shape.Length - 2; i++)
+            {
+                resultShape[i] = a.Shape[i];
+            }
+            resultShape[^2] = aRows;
+            resultShape[^1] = bCols;
+            
+            var result = new Tensor(resultShape, a.RequiresGrad || b.RequiresGrad);
+            result.Operation = new BatchedMatMulOp(a, b, result, transposeA, transposeB);
+            result.Parents.Add(a);
+            result.Parents.Add(b);
+            return result;
+        }
+        
+        public static Tensor Add(Tensor a, Tensor b)
+        {
+            if (a.TotalSize != b.TotalSize)
+                throw new ArgumentException($"Cannot add tensors of different sizes: {a.TotalSize} != {b.TotalSize}");
+            
+            var result = new Tensor(a.Shape, a.RequiresGrad || b.RequiresGrad);
+            result.Operation = new AddOp(a, b, result);
+            result.Parents.Add(a);
+            result.Parents.Add(b);
+            return result;
+        }
+        
+        public static Tensor Scale(Tensor input, float scale)
+        {
+            if (!input.RequiresGrad)
+            {
+                // Optimize: if no gradient needed, just create a new tensor
+                var result = new Tensor(input.Shape, false);
+                for (int i = 0; i < result.TotalSize; i++)
+                {
+                    result.Data[i] = input.Data[i] * scale;
+                }
+                return result;
+            }
+            
+            var resultGrad = new Tensor(input.Shape, input.RequiresGrad);
+            resultGrad.Operation = new ScaleOp(input, resultGrad, scale);
+            resultGrad.Parents.Add(input);
+            return resultGrad;
+        }
+        
+        public static Tensor AddBias(Tensor input, Tensor bias)
+        {
+            if (input.Shape[^1] != bias.Shape[0])
+                throw new ArgumentException($"Bias dimension mismatch: {input.Shape[^1]} != {bias.Shape[0]}");
+            
+            var result = new Tensor(input.Shape, input.RequiresGrad || bias.RequiresGrad);
+            result.Operation = new AddBiasOp(input, bias, result);
+            result.Parents.Add(input);
+            result.Parents.Add(bias);
+            return result;
+        }
+        
+        public static Tensor Softmax(Tensor input)
+        {
+            var result = new Tensor(input.Shape, input.RequiresGrad);
+            result.Operation = new SoftmaxOp(input, result);
+            result.Parents.Add(input);
+            return result;
+        }
+        
+        public static Tensor GELU(Tensor input)
+        {
+            if (!input.RequiresGrad)
+            {
+                // Optimized path for inference
+                var result = new Tensor(input.Shape, false);
+                const float sqrt2OverPi = 0.7978845608028654f;
+                const float coeff = 0.044715f;
+                
+                for (int i = 0; i < result.TotalSize; i++)
+                {
+                    float x = input.Data[i];
+                    float x3 = x * x * x;
+                    float inner = sqrt2OverPi * (x + coeff * x3);
+                    float tanhVal = (float)Math.Tanh(inner);
+                    result.Data[i] = 0.5f * x * (1 + tanhVal);
+                }
+                return result;
+            }
+            
+            var resultGrad = new Tensor(input.Shape, input.RequiresGrad);
+            resultGrad.Operation = new GELUOp(input, resultGrad);
+            resultGrad.Parents.Add(input);
+            return resultGrad;
+        }
+        
+        public static Tensor LayerNorm(Tensor input, Tensor gamma, Tensor beta, float eps = 1e-5f)
+        {
+            int lastDim = input.Shape[^1];
+            int outer = input.TotalSize / lastDim;
+            
+            var result = new Tensor(input.Shape, input.RequiresGrad || gamma.RequiresGrad || beta.RequiresGrad);
+            
+            // Cache for backward
+            var meanCache = new float[outer];
+            var invStdCache = new float[outer];
+            var normalizedCache = new float[input.TotalSize];
+            
+            // Forward pass
+            for (int i = 0; i < outer; i++)
+            {
+                // Compute mean
+                float mean = 0;
+                for (int j = 0; j < lastDim; j++)
+                {
+                    mean += input.Data[i * lastDim + j];
+                }
+                mean /= lastDim;
+                meanCache[i] = mean;
+                
+                // Compute variance
+                float var = 0;
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float diff = input.Data[i * lastDim + j] - mean;
+                    var += diff * diff;
+                }
+                var /= lastDim;
+                
+                // Compute inverse std
+                float invStd = 1.0f / (float)Math.Sqrt(var + eps);
+                invStdCache[i] = invStd;
+                
+                // Normalize and apply affine transform
+                for (int j = 0; j < lastDim; j++)
+                {
+                    float norm = (input.Data[i * lastDim + j] - mean) * invStd;
+                    normalizedCache[i * lastDim + j] = norm;
+                    result.Data[i * lastDim + j] = norm * gamma.Data[j] + beta.Data[j];
+                }
+            }
+            
+            result.Operation = new LayerNormOp(input, gamma, beta, result, meanCache, invStdCache, normalizedCache);
+            result.Parents.Add(input);
+            result.Parents.Add(gamma);
+            result.Parents.Add(beta);
+            return result;
+        }
+        
+        public static Tensor CreateCausalMask(int batch, int seqLen, int numHeads = 1, float maskValue = -1e9f)
+        {
+            var data = new float[batch * numHeads * seqLen * seqLen];
+            
+            for (int b = 0; b < batch; b++)
+            {
+                for (int h = 0; h < numHeads; h++)
+                {
+                    for (int i = 0; i < seqLen; i++)
+                    {
+                        for (int j = 0; j < seqLen; j++)
+                        {
+                            int idx = ((b * numHeads + h) * seqLen + i) * seqLen + j;
+                            data[idx] = (j > i) ? maskValue : 0;
+                        }
+                    }
+                }
+            }
+            
+            return new Tensor(data, new[] { batch, numHeads, seqLen, seqLen }, false, "causal_mask");
+        }
+    }
+    
+    // ==================== NEURAL NETWORK LAYERS ====================
+    
+    public class Parameter
+    {
+        public Tensor Data { get; set; }
+        public string Name { get; set; }
+        
+        public Parameter(int[] shape, string name, Random random, float scale = 0.02f)
+        {
+            Name = name;
+            Data = new Tensor(shape, true, name);
+            
+            // Xavier/Glorot initialization
+            float fanIn = shape.Length > 1 ? shape[1] : shape[0];
+            float fanOut = shape[0];
+            float std = scale * (float)Math.Sqrt(2.0 / (fanIn + fanOut));
+            
+            for (int i = 0; i < Data.TotalSize; i++)
+            {
+                Data.Data[i] = (float)(random.NextDouble() * 2 - 1) * std;
+            }
+        }
+        
+        public Parameter(Tensor data, string name)
+        {
+            Name = name;
+            Data = data;
+            Data.RequiresGrad = true;
+        }
+        
+        public void ZeroGrad() => Data.ZeroGrad();
+        
+        public override string ToString()
+        {
+            return $"Parameter({Name}, shape=[{string.Join(",", Data.Shape)}])";
+        }
+    }
+    
+    public class Linear
+    {
+        public Parameter Weight { get; set; }
+        public Parameter Bias { get; set; }
+        private int _inputDim, _outputDim;
+        private bool _useBias;
+        
+        public Linear(int inputDim, int outputDim, Random random, string name, bool useBias = true)
+        {
+            _inputDim = inputDim;
+            _outputDim = outputDim;
+            _useBias = useBias;
+            
+            // Weight shape: [outputDim, inputDim] for x * W^T
+            Weight = new Parameter(new[] { outputDim, inputDim }, $"{name}.weight", random);
+            
+            if (useBias)
+            {
+                Bias = new Parameter(new[] { outputDim }, $"{name}.bias", random, 0f);
+            }
+        }
+        
+        public Tensor Forward(Tensor x)
+        {
+            // x: [..., inputDim]
+            int outer = 1;
+            for (int i = 0; i < x.Shape.Length - 1; i++)
+                outer *= x.Shape[i];
+            
+            var x2D = x.Reshape(outer, _inputDim);
+            
+            // x * W^T + b
+            var output2D = Ops.MatMul(x2D, Weight.Data, transposeB: true);
+            
+            if (_useBias && Bias != null)
+            {
+                output2D = Ops.AddBias(output2D, Bias.Data);
+            }
+            
+            // Reshape back
+            var outputShape = x.Shape.ToArray();
+            outputShape[^1] = _outputDim;
+            return output2D.Reshape(outputShape);
+        }
+    }
+    
+    public class Embedding
+    {
+        public Parameter Weight { get; set; }
+        private int _vocabSize, _embeddingDim;
+        
+        public Embedding(int vocabSize, int embeddingDim, Random random, string name)
+        {
+            _vocabSize = vocabSize;
+            _embeddingDim = embeddingDim;
+            Weight = new Parameter(new[] { vocabSize, embeddingDim }, name, random);
+        }
+        
+        public Tensor Forward(Tensor indices)
+        {
+            int batch = indices.Shape[0];
+            int seqLen = indices.Shape[1];
+            
+            var result = new Tensor(new[] { batch, seqLen, _embeddingDim }, true, "embedding");
+            
+            // Simple gather operation
+            for (int b = 0; b < batch; b++)
+            {
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int idx = (int)indices.Data[b * seqLen + s];
+                    if (idx < 0 || idx >= _vocabSize)
+                        throw new ArgumentException($"Index {idx} out of bounds for vocab size {_vocabSize}");
+                    
+                    Array.Copy(Weight.Data.Data, idx * _embeddingDim,
+                              result.Data, (b * seqLen + s) * _embeddingDim, _embeddingDim);
+                }
+            }
+            
+            // Create embedding operation
+            result.Operation = new EmbeddingOp(Weight.Data, result, indices);
+            result.Parents.Add(Weight.Data);
+            
+            return result;
+        }
+    }
+    
+    public class EmbeddingOp : IAutogradOperation
+    {
+        private Tensor _weight, _result;
+        private Tensor _indices;
+        
+        public EmbeddingOp(Tensor weight, Tensor result, Tensor indices)
+        {
+            _weight = weight;
+            _result = result;
+            _indices = indices;
+        }
+        
+        public Tensor[] GetInputs() => new[] { _weight };
+        public Tensor[] GetOutputs() => new[] { _result };
+        
+        public void Forward() { }
+        
+        public void Backward()
+        {
+            if (!_weight.RequiresGrad || _weight.Grad == null) return;
+            
+            int batch = _indices.Shape[0];
+            int seqLen = _indices.Shape[1];
+            int embeddingDim = _weight.Shape[1];
+            
+            // Accumulate gradients into weight matrix
+            for (int b = 0; b < batch; b++)
+            {
+                for (int s = 0; s < seqLen; s++)
+                {
+                    int idx = (int)_indices.Data[b * seqLen + s];
+                    int resultOffset = (b * seqLen + s) * embeddingDim;
+                    int weightOffset = idx * embeddingDim;
+                    
+                    for (int d = 0; d < embeddingDim; d++)
+                    {
+                        _weight.Grad[weightOffset + d] += _result.Grad[resultOffset + d];
+                    }
+                }
+            }
+        }
+    }
+    
+    public class LayerNormLayer
+    {
+        public Parameter Gamma { get; }
+        public Parameter Beta { get; }
+        private int _dim;
+        private float _eps;
+        
+        public LayerNormLayer(int dim, float eps = 1e-5f, string name = "layernorm")
+        {
+            _dim = dim;
+            _eps = eps;
+            
+            Gamma = new Parameter(new[] { dim }, $"{name}.gamma", new Random(42), 1f);
+            Beta = new Parameter(new[] { dim }, $"{name}.beta", new Random(42), 0f);
+        }
+        
+        public Tensor Forward(Tensor x)
+        {
+            return Ops.LayerNorm(x, Gamma.Data, Beta.Data, _eps);
+        }
+    }
+    
+    public class MultiHeadAttention
+    {
+        private Linear _query, _key, _value, _output;
+        private int _numHeads, _headDim, _embeddingDim;
+        private float _scale;
+        
+        public MultiHeadAttention(int embeddingDim, int numHeads, Random random, string name)
+        {
+            _embeddingDim = embeddingDim;
+            _numHeads = numHeads;
+            _headDim = embeddingDim / numHeads;
+            _scale = (float)Math.Sqrt(_headDim);
+            
+            if (embeddingDim % numHeads != 0)
+                throw new ArgumentException($"Embedding dimension {embeddingDim} must be divisible by number of heads {numHeads}");
+            
+            _query = new Linear(embeddingDim, embeddingDim, random, $"{name}.q_proj");
+            _key = new Linear(embeddingDim, embeddingDim, random, $"{name}.k_proj");
+            _value = new Linear(embeddingDim, embeddingDim, random, $"{name}.v_proj");
+            _output = new Linear(embeddingDim, embeddingDim, random, $"{name}.out_proj");
+        }
+        
+        public Tensor Forward(Tensor x, Tensor mask = null)
+        {
+            int batch = x.Shape[0];
+            int seqLen = x.Shape[1];
+            
+            // 1. Linear projections
+            var Q = _query.Forward(x);
+            var K = _key.Forward(x);
+            var V = _value.Forward(x);
+            
+            // 2. Reshape for multi-head attention
+            // Reshape to [batch, seq_len, num_heads, head_dim]
+            var Q_heads = Q.Reshape(batch, seqLen, _numHeads, _headDim);
+            var K_heads = K.Reshape(batch, seqLen, _numHeads, _headDim);
+            var V_heads = V.Reshape(batch, seqLen, _numHeads, _headDim);
+            
+            // 3. Transpose for attention computation: [batch, num_heads, seq_len, head_dim]
+            Q_heads = Q_heads.Permute(0, 2, 1, 3);
+            K_heads = K_heads.Permute(0, 2, 1, 3);
+            V_heads = V_heads.Permute(0, 2, 1, 3);
+            
+            // 4. Compute attention scores: Q @ K^T / sqrt(d_k)
+            var K_T = K_heads.Permute(0, 1, 3, 2); // [batch, num_heads, head_dim, seq_len]
+            
+            // Use batched matmul with correct dimensions
+            var scores = Ops.BatchedMatMul(Q_heads, K_T); // [batch, num_heads, seq_len, seq_len]
+            scores = Ops.Scale(scores, 1.0f / _scale);
+            
+            // 5. Apply mask if provided
+            if (mask != null)
+            {
+                scores = Ops.Add(scores, mask);
+            }
+            
+            // 6. Softmax
+            var attention = Ops.Softmax(scores);
+            
+            // 7. Apply attention to values
+            var attentionOut = Ops.BatchedMatMul(attention, V_heads); // [batch, num_heads, seq_len, head_dim]
+            
+            // 8. Transpose back and reshape
+            attentionOut = attentionOut.Permute(0, 2, 1, 3); // [batch, seq_len, num_heads, head_dim]
+            attentionOut = attentionOut.Reshape(batch, seqLen, _embeddingDim);
+            
+            // 9. Final projection
+            return _output.Forward(attentionOut);
+        }
+        
+        public List<Parameter> GetParameters()
+        {
+            var parameters = new List<Parameter>();
+            parameters.Add(_query.Weight);
+            if (_query.Bias != null) parameters.Add(_query.Bias);
+            
+            parameters.Add(_key.Weight);
+            if (_key.Bias != null) parameters.Add(_key.Bias);
+            
+            parameters.Add(_value.Weight);
+            if (_value.Bias != null) parameters.Add(_value.Bias);
+            
+            parameters.Add(_output.Weight);
+            if (_output.Bias != null) parameters.Add(_output.Bias);
+            
+            return parameters;
+        }
+    }
+    
+    public class FeedForward
+    {
+        private Linear _fc1, _fc2;
+        
+        public FeedForward(int embeddingDim, int hiddenDim, Random random, string name = "ffn")
+        {
+            _fc1 = new Linear(embeddingDim, hiddenDim, random, $"{name}.fc1");
+            _fc2 = new Linear(hiddenDim, embeddingDim, random, $"{name}.fc2");
+        }
+        
+        public Tensor Forward(Tensor x)
+        {
+            var hidden = _fc1.Forward(x);
+            hidden = Ops.GELU(hidden);
+            return _fc2.Forward(hidden);
+        }
+        
+        public List<Parameter> GetParameters()
+        {
+            var parameters = new List<Parameter>();
+            parameters.Add(_fc1.Weight);
+            if (_fc1.Bias != null) parameters.Add(_fc1.Bias);
+            
+            parameters.Add(_fc2.Weight);
+            if (_fc2.Bias != null) parameters.Add(_fc2.Bias);
+            
+            return parameters;
+        }
+    }
+    
+    public class TransformerBlock
+    {
+        private LayerNormLayer _norm1, _norm2;
+        private MultiHeadAttention _attention;
+        private FeedForward _ffn;
+        
+        public TransformerBlock(int embeddingDim, int numHeads, int hiddenDim, 
+                               Random random, string name = "block")
+        {
+            _norm1 = new LayerNormLayer(embeddingDim, name: $"{name}.norm1");
+            _attention = new MultiHeadAttention(embeddingDim, numHeads, random, $"{name}.attn");
+            _norm2 = new LayerNormLayer(embeddingDim, name: $"{name}.norm2");
+            _ffn = new FeedForward(embeddingDim, hiddenDim, random, $"{name}.ffn");
+        }
+        
+        public Tensor Forward(Tensor x, Tensor mask = null)
+        {
+            // Self-attention with residual connection
+            var attnInput = _norm1.Forward(x);
+            var attnOutput = _attention.Forward(attnInput, mask);
+            var x1 = Ops.Add(x, attnOutput);
+            
+            // Feed-forward with residual connection
+            var ffnInput = _norm2.Forward(x1);
+            var ffnOutput = _ffn.Forward(ffnInput);
+            return Ops.Add(x1, ffnOutput);
+        }
+        
+        public List<Parameter> GetParameters()
+        {
+            var parameters = new List<Parameter>();
+            
+            parameters.Add(_norm1.Gamma);
+            parameters.Add(_norm1.Beta);
+            
+            parameters.AddRange(_attention.GetParameters());
+            
+            parameters.Add(_norm2.Gamma);
+            parameters.Add(_norm2.Beta);
+            
+            parameters.AddRange(_ffn.GetParameters());
+            
+            return parameters;
+        }
+    }
+    
+    // ==================== GPT MODEL ====================
+    
+    public class GPT
+    {
+        private Embedding _tokenEmbedding;
+        private Embedding _positionEmbedding;
+        private List<TransformerBlock> _blocks;
+        private LayerNormLayer _finalNorm;
+        private Linear _lmHead;
+        private Random _random;
+        
+        private int _vocabSize;
+        private int _embeddingDim;
+        private int _maxSeqLen;
+        private int _numLayers;
+        private int _numHeads;
+        
+        private List<Parameter> _allParameters;
+        private bool _weightTied;
+        private bool _training;
+        
+        public GPT(int vocabSize, int embeddingDim, int numLayers, 
+                  int numHeads, int hiddenDim, int maxSeqLen, 
+                  Random random, bool tieWeights = true)
+        {
+            _vocabSize = vocabSize;
+            _embeddingDim = embeddingDim;
+            _numLayers = numLayers;
+            _numHeads = numHeads;
+            _maxSeqLen = maxSeqLen;
+            _random = random;
+            _weightTied = tieWeights;
+            _training = true;
+            
+            _allParameters = new List<Parameter>();
+            
+            // Token embeddings
+            _tokenEmbedding = new Embedding(vocabSize, embeddingDim, random, "token_embed");
+            _allParameters.Add(_tokenEmbedding.Weight);
+            
+            // Position embeddings
+            _positionEmbedding = new Embedding(maxSeqLen, embeddingDim, random, "pos_embed");
+            _allParameters.Add(_positionEmbedding.Weight);
+            
+            // Transformer blocks
+            _blocks = new List<TransformerBlock>();
+            for (int i = 0; i < numLayers; i++)
+            {
+                var block = new TransformerBlock(embeddingDim, numHeads, hiddenDim, 
+                                                random, $"blocks.{i}");
+                _blocks.Add(block);
+                _allParameters.AddRange(block.GetParameters());
+            }
+            
+            // Final layer norm
+            _finalNorm = new LayerNormLayer(embeddingDim, name: "final_norm");
+            _allParameters.Add(_finalNorm.Gamma);
+            _allParameters.Add(_finalNorm.Beta);
+            
+            // Language modeling head
+            _lmHead = new Linear(embeddingDim, vocabSize, random, "lm_head", useBias: false);
+            if (!tieWeights)
+            {
+                _allParameters.Add(_lmHead.Weight);
+            }
+            else
+            {
+                // Weight tying: share the same Parameter object
+                _lmHead.Weight = _tokenEmbedding.Weight;
+            }
+        }
+        
+        public void Train()
+        {
+            _training = true;
+        }
+        
+        public void Eval()
+        {
+            _training = false;
+        }
+        
+        public Tensor Forward(Tensor tokenIds, Tensor mask = null)
+        {
+            int batch = tokenIds.Shape[0];
+            int seqLen = tokenIds.Shape[1];
+            
+            if (seqLen > _maxSeqLen)
+                throw new ArgumentException($"Sequence length {seqLen} exceeds maximum {_maxSeqLen}");
+            
+            // 1. Token embeddings
+            var tokenEmb = _tokenEmbedding.Forward(tokenIds);
+            
+            // 2. Position embeddings
+            var posIds = CreatePositionIds(batch, seqLen);
+            var posEmb = _positionEmbedding.Forward(posIds);
+            
+            // 3. Add position embeddings
+            var x = Ops.Add(tokenEmb, posEmb);
+            
+            // 4. Create causal mask if not provided
+            var causalMask = mask ?? Ops.CreateCausalMask(batch, seqLen, _numHeads, -1e9f);
+            
+            // 5. Transformer blocks
+            foreach (var block in _blocks)
+            {
+                x = block.Forward(x, causalMask);
+            }
+            
+            // 6. Final layer norm
+            x = _finalNorm.Forward(x);
+            
+            // 7. Language modeling head
+            return _lmHead.Forward(x);
+        }
+        
+        private Tensor CreatePositionIds(int batch, int seqLen)
+        {
+            var data = new float[batch * seqLen];
+            for (int b = 0; b < batch; b++)
+            {
+                for (int i = 0; i < seqLen; i++)
+                {
+                    data[b * seqLen + i] = i;
+                }
+            }
+            return new Tensor(data, new[] { batch, seqLen }, false, "position_ids");
+        }
+        
+        public List<Parameter> GetAllParameters()
+        {
+            return _allParameters;
+        }
+        
+        public void ZeroGrad()
+        {
+            foreach (var param in _allParameters)
+            {
+                param.ZeroGrad();
+            }
+        }
+        
+        public string Generate(string prompt, Func<string, List<int>> tokenize, 
+                             Func<List<int>, string> detokenize, 
+                             int maxTokens = 100, float temperature = 0.8f)
+        {
+            Eval();
+            
+            var tokens = tokenize(prompt);
+            var generated = new List<int>(tokens);
+            
+            for (int i = 0; i < maxTokens; i++)
+            {
+                // Prepare input
+                var inputTokens = generated;
+                if (inputTokens.Count > _maxSeqLen)
+                {
+                    inputTokens = inputTokens.Skip(inputTokens.Count - _maxSeqLen).ToList();
+                }
+                
+                // Create input tensor
+                var input = new Tensor(new[] { 1, inputTokens.Count }, false);
+                for (int j = 0; j < inputTokens.Count; j++)
+                {
+                    input.Data[j] = inputTokens[j];
+                }
+                
+                // Forward pass
+                var logits = Forward(input);
+                
+                // Get last token logits
+                var lastLogits = new float[_vocabSize];
+                int lastPos = inputTokens.Count - 1;
+                for (int v = 0; v < _vocabSize; v++)
+                {
+                    lastLogits[v] = logits[0, lastPos, v];
+                }
+                
+                // Apply temperature
+                if (temperature != 1.0f)
+                {
+                    for (int v = 0; v < _vocabSize; v++)
+                    {
+                        lastLogits[v] /= temperature;
+                    }
+                }
+                
+                // Softmax
+                float max = lastLogits.Max();
+                float sum = 0;
+                for (int v = 0; v < _vocabSize; v++)
+                {
+                    lastLogits[v] = (float)Math.Exp(lastLogits[v] - max);
+                    sum += lastLogits[v];
+                }
+                for (int v = 0; v < _vocabSize; v++)
+                {
+                    lastLogits[v] /= sum;
+                }
+                
+                // Sample from distribution
+                float r = (float)_random.NextDouble();
+                float cumulative = 0;
+                int nextToken = 0;
+                
+                for (int v = 0; v < _vocabSize; v++)
+                {
+                    cumulative += lastLogits[v];
+                    if (r <= cumulative)
+                    {
+                        nextToken = v;
+                        break;
+                    }
+                }
+                
+                generated.Add(nextToken);
+                
+                // Stop at EOS token (assuming 2 is EOS)
+                if (nextToken == 2)
+                    break;
+            }
+            
+            Train(); // Switch back to training mode
+            return detokenize(generated);
+        }
+        
+        // Validation and debugging
+        public void ValidateGradients()
+        {
+            Console.WriteLine("\n=== Gradient Validation ===");
+            bool allValid = true;
+            
+            foreach (var param in _allParameters)
+            {
+                if (param.Data.Grad != null)
+                {
+                    float norm = param.Data.GradientNorm();
+                    bool valid = param.Data.HasValidGradients();
+                    
+                    if (!valid)
+                    {
+                        allValid = false;
+                        Console.WriteLine($"❌ {param.Name}: Invalid gradients (NaN/Inf)");
+                    }
+                    else if (norm == 0)
+                    {
+                        Console.WriteLine($"⚠️  {param.Name}: Zero gradient norm");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"✅ {param.Name}: grad_norm = {norm:E3}");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"❌ {param.Name}: No gradients");
+                    allValid = false;
+                }
+            }
+            
+            if (allValid)
+                Console.WriteLine("All gradients are valid!");
+            else
+                Console.WriteLine("Some gradients have issues!");
+            
+            Console.WriteLine("==========================\n");
+        }
+    }
+    
+    // ==================== OPTIMIZER ====================
+    
+    public class AdamW
+    {
+        private Dictionary<Parameter, (float[] m, float[] v)> _states;
+        private float _learningRate;
+        private float _beta1, _beta2;
+        private float _epsilon;
+        private float _weightDecay;
+        private int _timestep;
+        
+        public AdamW(float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, 
+                    float epsilon = 1e-8f, float weightDecay = 0.01f)
+        {
+            _learningRate = lr;
+            _beta1 = beta1;
+            _beta2 = beta2;
+            _epsilon = epsilon;
+            _weightDecay = weightDecay;
+            _states = new Dictionary<Parameter, (float[] m, float[] v)>();
+            _timestep = 0;
+        }
+        
+        public void RegisterParameters(List<Parameter> parameters)
+        {
+            foreach (var param in parameters)
+            {
+                if (!_states.ContainsKey(param))
+                {
+                    _states[param] = (
+                        new float[param.Data.TotalSize],
+                        new float[param.Data.TotalSize]
+                    );
+                }
+            }
+        }
+        
+        public void Step(List<Parameter> parameters)
+        {
+            _timestep++;
+            float lr = _learningRate;
+            float beta1 = _beta1;
+            float beta2 = _beta2;
+            float eps = _epsilon;
+            float wd = _weightDecay;
+            
+            float biasCorrection1 = 1 - (float)Math.Pow(beta1, _timestep);
+            float biasCorrection2 = 1 - (float)Math.Pow(beta2, _timestep);
+            
+            foreach (var param in parameters)
+            {
+                if (!_states.TryGetValue(param, out var state))
+                    continue;
+                
+                var (m, v) = state;
+                var data = param.Data.Data;
+                var grad = param.Data.Grad;
+                
+                if (grad == null) continue;
+                
+                for (int i = 0; i < data.Length; i++)
+                {
+                    float g = grad[i];
+                    
+                    // Weight decay (AdamW style)
+                    data[i] -= lr * wd * data[i];
+                    
+                    // Update moments
+                    m[i] = beta1 * m[i] + (1 - beta1) * g;
+                    v[i] = beta2 * v[i] + (1 - beta2) * g * g;
+                    
+                    // Bias correction
+                    float mHat = m[i] / biasCorrection1;
+                    float vHat = v[i] / biasCorrection2;
+                    
+                    // Update parameter
+                    data[i] -= lr * mHat / ((float)Math.Sqrt(vHat) + eps);
+                }
+            }
+        }
+        
+        public void ClipGradients(List<Parameter> parameters, float maxNorm)
+        {
+            float totalNorm = 0;
+            
+            foreach (var param in parameters)
+            {
+                var grad = param.Data.Grad;
+                if (grad == null) continue;
+                
+                for (int i = 0; i < grad.Length; i++)
+                {
+                    totalNorm += grad[i] * grad[i];
+                }
+            }
+            
+            totalNorm = (float)Math.Sqrt(totalNorm);
+            
+            if (totalNorm > maxNorm)
+            {
+                float scale = maxNorm / (totalNorm + 1e-6f);
+                
+                foreach (var param in parameters)
+                {
+                    var grad = param.Data.Grad;
+                    if (grad == null) continue;
+                    
+                    for (int i = 0; i < grad.Length; i++)
+                    {
+                        grad[i] *= scale;
+                    }
+                }
+            }
+        }
+    }
+    
+    // ==================== LOSS FUNCTIONS ====================
+    
+    public static class Loss
+    {
+        public static (float loss, Tensor grad) CrossEntropy(Tensor logits, Tensor targets)
+        {
+            // logits: [batch, seq_len, vocab_size]
+            // targets: [batch, seq_len]
+            
+            int batch = logits.Shape[0];
+            int seqLen = logits.Shape[1];
+            int vocabSize = logits.Shape[2];
+            
+            float loss = 0;
+            var grad = new Tensor(logits.Shape, false);
+            
+            for (int b = 0; b < batch; b++)
+            {
+                for (int s = 0; s < seqLen; s++)
+                {
+                    // Softmax for stability
+                    float max = float.NegativeInfinity;
+                    for (int v = 0; v < vocabSize; v++)
+                    {
+                        max = Math.Max(max, logits[b, s, v]);
+                    }
+                    
+                    float sum = 0;
+                    float[] probs = new float[vocabSize];
+                    
+                    for (int v = 0; v < vocabSize; v++)
+                    {
+                        float exp = (float)Math.Exp(logits[b, s, v] - max);
+                        probs[v] = exp;
+                        sum += exp;
+                    }
+                    
+                    for (int v = 0; v < vocabSize; v++)
+                    {
+                        probs[v] /= sum;
+                        grad[b, s, v] = probs[v];
+                    }
+                    
+                    int target = (int)targets[b, s];
+                    if (target >= 0 && target < vocabSize)
+                    {
+                        loss -= (float)Math.Log(Math.Max(probs[target], 1e-12f));
+                        grad[b, s, target] -= 1.0f;
+                    }
+                }
+            }
+            
+            loss /= (batch * seqLen);
+            
+            // Scale gradient
+            for (int i = 0; i < grad.TotalSize; i++)
+            {
+                grad.Data[i] /= (batch * seqLen);
+            }
+            
+            return (loss, grad);
+        }
+    }
+    
+    // ==================== DATASET ====================
+    
+    public class TextDataset
+    {
+        private List<int[]> _sequences;
+        private Random _random;
+        private int _seqLen;
+        
+        public TextDataset(List<string> texts, Func<string, List<int>> tokenize, int seqLen, Random random)
+        {
+            _seqLen = seqLen;
+            _random = random;
+            
+            _sequences = new List<int[]>();
+            
+            foreach (var text in texts)
+            {
+                var tokens = tokenize(text);
+                
+                if (tokens.Count < seqLen + 1)
+                    continue;
+                
+                // Create overlapping sequences
+                for (int i = 0; i <= tokens.Count - seqLen - 1; i++)
+                {
+                    var seq = new int[seqLen + 1];
+                    for (int j = 0; j < seqLen + 1; j++)
+                    {
+                        seq[j] = tokens[i + j];
+                    }
+                    _sequences.Add(seq);
+                }
+            }
+        }
+        
+        public (Tensor inputs, Tensor targets) GetBatch(int batchSize)
+        {
+            var inputs = new Tensor(new[] { batchSize, _seqLen }, false);
+            var targets = new Tensor(new[] { batchSize, _seqLen }, false);
+            
+            for (int b = 0; b < batchSize; b++)
+            {
+                if (_sequences.Count == 0)
+                    throw new InvalidOperationException("No sequences in dataset");
+                
+                var seq = _sequences[_random.Next(_sequences.Count)];
+                
+                for (int s = 0; s < _seqLen; s++)
+                {
+                    inputs[b, s] = seq[s];
+                    targets[b, s] = seq[s + 1];
+                }
+            }
+            
+            return (inputs, targets);
+        }
+        
+        public int SequenceCount => _sequences.Count;
+    }
+    
+    // ==================== TOKENIZER ====================
+    
+    public class SimpleTokenizer
+    {
+        private Dictionary<string, int> _vocab = new Dictionary<string, int>();
+        private Dictionary<int, string> _reverseVocab = new Dictionary<int, string>();
+        private int _nextId = 0;
+        
+        public SimpleTokenizer()
+        {
+            // Add special tokens
+            AddToken("[PAD]");
+            AddToken("[BOS]");
+            AddToken("[EOS]");
+            AddToken("[UNK]");
+            
+            // Add basic characters
+            for (char c = 'a'; c <= 'z'; c++) AddToken(c.ToString());
+            for (char c = 'A'; c <= 'Z'; c++) AddToken(c.ToString());
+            for (char c = '0'; c <= '9'; c++) AddToken(c.ToString());
+            
+            // Add punctuation
+            AddToken(" ");
+            AddToken(".");
+            AddToken(",");
+            AddToken("!");
+            AddToken("?");
+            AddToken("'");
+            AddToken("\"");
+            AddToken("-");
+            AddToken("\n");
+        }
+        
+        public void Train(string text)
+        {
+            // Simple word-based tokenization
+            var words = text.Split(new[] { ' ', '.', ',', '!', '?', '\n', '\r', '\t' }, 
+                StringSplitOptions.RemoveEmptyEntries);
+            
+            foreach (var word in words)
+            {
+                var normalized = word.ToLower();
+                if (!_vocab.ContainsKey(normalized) && normalized.Length > 1)
+                {
+                    AddToken(normalized);
+                }
+            }
+        }
+        
+        private void AddToken(string token)
+        {
+            if (!_vocab.ContainsKey(token))
+            {
+                _vocab[token] = _nextId;
+                _reverseVocab[_nextId] = token;
+                _nextId++;
+            }
+        }
+        
+        public List<int> Encode(string text)
+        {
+            var tokens = new List<int>();
+            tokens.Add(_vocab["[BOS]"]);
+            
+            // Simple whitespace tokenization
+            var parts = text.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            
+            foreach (var part in parts)
+            {
+                var word = part.ToLower();
+                
+                if (_vocab.TryGetValue(word, out int id))
+                {
+                    tokens.Add(id);
+                }
+                else
+                {
+                    // Character-level fallback
+                    foreach (char c in word)
+                    {
+                        string charStr = c.ToString();
+                        if (_vocab.TryGetValue(charStr, out int charId))
+                        {
+                            tokens.Add(charId);
+                        }
+                        else
+                        {
+                            tokens.Add(_vocab["[UNK]"]);
+                        }
+                    }
+                }
+            }
+            
+            tokens.Add(_vocab["[EOS]"]);
+            return tokens;
+        }
+        
+        public string Decode(List<int> tokenIds)
+        {
+            var sb = new StringBuilder();
+            
+            foreach (var id in tokenIds)
+            {
+                if (_reverseVocab.TryGetValue(id, out var token))
+                {
+                    if (token == "[BOS]" || token == "[EOS]" || token == "[PAD]")
+                        continue;
+                    
+                    if (sb.Length > 0 && !token.StartsWith("##") && token != ".")
+                        sb.Append(" ");
+                    
+                    sb.Append(token);
+                }
+            }
+            
+            return sb.ToString();
+        }
+        
+        public int VocabSize => _nextId;
+        public int PadTokenId => _vocab["[PAD]"];
+        public int BosTokenId => _vocab["[BOS]"];
+        public int EosTokenId => _vocab["[EOS]"];
+    }
+    
+    // ==================== MAIN PROGRAM ====================
+    
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            Console.WriteLine("========================================");
+            Console.WriteLine("     PROFESSIONAL GPT IMPLEMENTATION   ");
+            Console.WriteLine("========================================\n");
+            
+            // Initialize tokenizer
+            var tokenizer = new SimpleTokenizer();
+            
+            // Training text
+            string trainingText = @"
+                The quick brown fox jumps over the lazy dog.
+                Artificial intelligence is transforming our world.
+                Machine learning enables computers to learn from data.
+                Deep learning models use neural networks with many layers.
+                Natural language processing helps computers understand human language.
+                Transformers are state-of-the-art models for many NLP tasks.
+                Attention mechanisms allow models to focus on relevant information.
+                Large language models can generate coherent and creative text.
+                The future of AI holds great promise and potential challenges.
+                Researchers are working on making AI systems more transparent and fair.
+            ";
+            
+            // Train tokenizer
+            Console.WriteLine("Training tokenizer...");
+            tokenizer.Train(trainingText);
+            Console.WriteLine($"Vocabulary size: {tokenizer.VocabSize}");
+            
+            // Model configuration
+            int embeddingDim = 128;
+            int numLayers = 4;
+            int numHeads = 4;
+            int hiddenDim = 512;
+            int maxSeqLen = 64;
+            int batchSize = 8;
+            int seqLen = 32;
+            
+            Random random = new Random(42);
+            
+            // Create model
+            Console.WriteLine("\nCreating GPT model...");
+            var model = new GPT(
+                tokenizer.VocabSize, embeddingDim, numLayers, numHeads,
+                hiddenDim, maxSeqLen, random, tieWeights: true
+            );
+            
+            Console.WriteLine($"Total parameters: {model.GetAllParameters().Count}");
+            
+            // Create dataset
+            Console.WriteLine("Creating dataset...");
+            var texts = trainingText.Split(new[] { '.', '!', '?' }, StringSplitOptions.RemoveEmptyEntries)
+                                   .Select(s => s.Trim())
+                                   .Where(s => s.Length > 0)
+                                   .ToList();
+            
+            var dataset = new TextDataset(texts, tokenizer.Encode, seqLen, random);
+            Console.WriteLine($"Dataset contains {dataset.SequenceCount} sequences");
+            
+            // Create optimizer
+            var optimizer = new AdamW(lr: 0.0001f, weightDecay: 0.01f);
+            optimizer.RegisterParameters(model.GetAllParameters());
+            
+            // Training loop
+            Console.WriteLine("\nStarting training...");
+            int numSteps = 1000;
+            int logInterval = 100;
+            
+            for (int step = 0; step < numSteps; step++)
+            {
+                try
+                {
+                    // Get batch
+                    var (inputs, targets) = dataset.GetBatch(batchSize);
+                    
+                    // Zero gradients
+                    model.ZeroGrad();
+                    
+                    // Forward pass
+                    var logits = model.Forward(inputs);
+                    
+                    // Compute loss
+                    var (loss, grad) = Loss.CrossEntropy(logits, targets);
+                    
+                    // Backward pass
+                    logits.Backward(grad);
+                    
+                    // Gradient clipping
+                    optimizer.ClipGradients(model.GetAllParameters(), maxNorm: 1.0f);
+                    
+                    // Update parameters
+                    optimizer.Step(model.GetAllParameters());
+                    
+                    // Log progress
+                    if ((step + 1) % logInterval == 0)
+                    {
+                        Console.WriteLine($"\nStep {step + 1}: Loss = {loss:F4}");
+                        
+                        // Validate gradients
+                        model.ValidateGradients();
+                        
+                        // Generate sample text
+                        try
+                        {
+                            string generated = model.Generate(
+                                "The future of",
+                                tokenizer.Encode,
+                                tokenizer.Decode,
+                                maxTokens: 20,
+                                temperature: 0.8f
+                            );
+                            
+                            Console.WriteLine($"Sample: {generated}");
+                            Console.WriteLine(new string('-', 50));
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Generation error: {ex.Message}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error at step {step}: {ex.Message}");
+                    break;
+                }
+            }
+            
+            // Interactive generation
+            Console.WriteLine("\n" + new string('=', 50));
+            Console.WriteLine("INTERACTIVE GENERATION");
+            Console.WriteLine(new string('=', 50));
+            
+            while (true)
+            {
+                Console.Write("\nEnter prompt (or 'exit'): ");
+                string prompt = Console.ReadLine();
+                
+                if (prompt?.ToLower() == "exit") break;
+                if (string.IsNullOrWhiteSpace(prompt)) continue;
+                
+                Console.WriteLine("\nGenerating...");
+                
+                try
+                {
+                    string generated = model.Generate(
+                        prompt,
+                        tokenizer.Encode,
+                        tokenizer.Decode,
+                        maxTokens: 50,
+                        temperature: 0.8f
+                    );
+                    
+                    Console.WriteLine($"Response: {generated}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error: {ex.Message}");
+                }
+                
+                Console.WriteLine(new string('-', 50));
+            }
+            
+            Console.WriteLine("\nTraining completed successfully!");
+        }
+    }
+}
